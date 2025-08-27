@@ -67,6 +67,8 @@ logger = logging.get_logger(__name__)
 
 TListOrMapping = TypeVar("TListOrMapping", list, Mapping)
 
+import pdb
+
 
 def remove_none_values(example: TListOrMapping) -> TListOrMapping:
     """
@@ -377,7 +379,7 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
             raise KeyError(f"Unexpected input keys in examples: {list(examples[0].keys())}.")
 
     def _collate_language_modeling(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
-        images = [example["images"] for example in examples]
+        images = [example["images"] for example in examples if len(example["images"]) > 0]
 
         if "messages" in examples[0]:  # conversational case
             for example in examples:
@@ -393,10 +395,10 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
             )
 
         output = self.processor(
-            images=images,
+            images=images if len(images) > 0 else None,
             text=texts,
             padding=True,
-            padding_side="right",
+            padding_side=self.processor.tokenizer.padding_side,
             pad_to_multiple_of=self.pad_to_multiple_of,
             truncation=self.max_length is not None,
             max_length=self.max_length,
