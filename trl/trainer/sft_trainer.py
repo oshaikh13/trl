@@ -385,7 +385,7 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
             for example in examples:
                 prepare_multimodal_messages(example["messages"], len(example["images"]))
             messages = [example["messages"] for example in examples]
-            texts = self.processor.apply_chat_template(messages)
+            texts = self.processor.apply_chat_template(messages, add_vision_id=True)
         elif self.dataset_text_field in examples[0]:  # standard case
             texts = [example[self.dataset_text_field] for example in examples]
         else:
@@ -405,6 +405,8 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
             return_tensors=self.return_tensors,
             add_special_tokens=False,  # to avoid adding the BOS, twice see https://huggingface.co/blog/qgallouedec/gotchas-in-tokenizer-behavior#7-chat-template-and-tokenization-dont-compose-due-to-special-tokens
         )
+
+        # pdb.set_trace()
         labels = output["input_ids"].clone()
         labels[output["attention_mask"] == 0] = -100
         # We mask only padding tokens (-100) in the labels. Vision tokens are left unchanged because their handling in
