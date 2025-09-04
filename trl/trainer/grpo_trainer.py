@@ -611,7 +611,9 @@ class GRPOTrainer(Trainer):
         # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt", "image"]
+            # self._signature_columns = ["prompt", "image"]
+            self._signature_columns = ["prompt", "images"]
+
 
     # This method overrides `Trainer.get_train_dataloader` to support our custom batching strategy.
     # Instead of returning a standard per-step batch (i.e., `per_device_batch_size), our dataloader loads an
@@ -1067,13 +1069,16 @@ class GRPOTrainer(Trainer):
         # [{"role": "user", "content": "What color is the sky?"}] to
         # [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What color is the sky?"}]}]
         kwargs = {}
-        has_images = "image" in inputs[0]
+        has_images = "images" in inputs[0]
+        images = [example.get("images", []) for example in inputs] if has_images else None
+        kwargs = {"images": images} if has_images else {}
+
+        # For conversational prompts, insert exactly len(images[i]) placeholders
         if has_images:
-            images = [example.get("image") for example in inputs]
-            kwargs = {"images": [[img] for img in images]}
-            for prompt in prompts:
-                if isinstance(prompt, list):  # i.e., when using conversational data
-                    prepare_multimodal_messages(prompt, num_images=1)
+            for prompt, imgs in zip(prompts, images):
+                if isinstance(prompt, list):
+                    prepare_multimodal_messages(prompt, num_images=len(imgs))
+
 
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
