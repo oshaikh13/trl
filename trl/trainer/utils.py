@@ -1804,36 +1804,87 @@ def identity(x):
     return x
 
 
-def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, Union[torch.Tensor, list[torch.Tensor]]]:
+def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """
-    Splits `batch["pixel_values"]` into a list of tensors based on the product of each row in
-    `batch["image_grid_thw"]`, while keeping other entries unchanged.
+    Split *multimodal* tensors by **sequence** using images_per_sample + image_grid_thw.
+    This ensures per-image/per-patch arrays stay aligned through shuffle/split.
+    Keys handled (when present):
+      - image_grid_thw        [total_images, 3]           -> list([ [n_i, 3], ... ]) per sequence
+      - pixel_values          [sum(prod(thw_i)), D]       -> list([ [sum_i prod, D], ... ]) per sequence
+      - pixel_attention_mask  [total_images, ...]         -> list per sequence
+      - image_sizes           [total_images, 2]           -> list per sequence
     """
+    # Nothing to do if multimodal fields aren’t present
     if "image_grid_thw" not in batch or "pixel_values" not in batch:
         return batch
-
-    lengths = batch["image_grid_thw"].prod(dim=1).tolist()  # [batch_size]
-    pixel_values = batch["pixel_values"]  # [total, feature_dim]
-
-    if sum(lengths) != pixel_values.size(0):
-        raise ValueError(f"Mismatch: sum(lengths) = {sum(lengths)} != pixel_values.size(0) = {pixel_values.size(0)}")
-
-    split_values = list(torch.split(batch["pixel_values"], lengths, dim=0))
-    return {**batch, "pixel_values": split_values}
-
-
-def unsplit_pixel_values_by_grid(batch: dict[str, Union[torch.Tensor, list[torch.Tensor]]]) -> dict[str, torch.Tensor]:
-    """
-    Opposite of `split_pixel_values_by_grid`. Merges a list of tensors in `batch["pixel_values"]` back into a single
-    tensor along the first dimension.
-    """
-    pixel_values = batch.get("pixel_values")
-
-    if isinstance(pixel_values, list):
-        merged = torch.cat(pixel_values, dim=0)
-        return {**batch, "pixel_values": merged}
-    else:
+    if "images_per_sample" not in batch:
+        # Without counts we cannot split per sequence safely; leave as-is
         return batch
+
+    image_grid_thw = batch["image_grid_thw"]
+    pixel_values = batch["pixel_values"]
+    counts = batch["images_per_sample"].tolist()  # per-sequence image counts
+
+    # Sanity: counts should sum to number of image rows
+    total_images = image_grid_thw.size(0)
+    if sum(counts) != total_images:
+        raise ValueError(
+            f"[split] images_per_sample sum ({sum(counts)}) != image_grid_thw rows ({total_images})"
+        )
+
+    # Split per-image arrays by sequence
+    img_splits = list(torch.split(image_grid_thw, counts, dim=0))
+
+    # Compute per-image patch lengths, then per-sequence patch lengths
+    thw_prod = image_grid_thw.prod(dim=1)  # [total_images]
+    per_seq_patch_lens = []
+    c = 0
+    for n in counts:
+        per_seq_patch_lens.append(int(thw_prod[c : c + n].sum().item()))
+        c += n
+
+    # Split pixel_values by per-sequence total patch lengths
+    if sum(per_seq_patch_lens) != pixel_values.size(0):
+        raise ValueError(
+            f"[split] sum(per_seq_patch_lens) ({sum(per_seq_patch_lens)}) != pixel_values rows ({pixel_values.size(0)})"
+        )
+    pv_splits = list(torch.split(pixel_values, per_seq_patch_lens, dim=0))
+
+    out = dict(batch)
+    out["image_grid_thw"] = img_splits
+    out["pixel_values"] = pv_splits
+
+    # Optional per-image fields: split with same counts
+    if "pixel_attention_mask" in batch and batch["pixel_attention_mask"] is not None:
+        pam = batch["pixel_attention_mask"]
+        if pam.size(0) != total_images:
+            raise ValueError(f"[split] pixel_attention_mask rows ({pam.size(0)}) != total_images ({total_images})")
+        out["pixel_attention_mask"] = list(torch.split(pam, counts, dim=0))
+
+    if "image_sizes" in batch and batch["image_sizes"] is not None:
+        isz = batch["image_sizes"]
+        if isz.size(0) != total_images:
+            raise ValueError(f"[split] image_sizes rows ({isz.size(0)}) != total_images ({total_images})")
+        out["image_sizes"] = list(torch.split(isz, counts, dim=0))
+
+    return out
+
+def unsplit_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    Inverse of the splitter above: if a key is a list (per-sequence), concatenate along dim 0
+    to get the flattened per-image/per-patch arrays expected by Qwen2.5-VL.
+    """
+    out = dict(batch)
+    for key in ("pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes"):
+        val = out.get(key, None)
+        if isinstance(val, list):
+            if len(val) == 0:
+                # keep an empty tensor with correct shape if possible
+                out[key] = torch.empty(0, *val[0].shape[1:], dtype=val[0].dtype, device=val[0].device)
+            else:
+                out[key] = torch.cat(val, dim=0)
+    return out
+
 
 
 def truncate_with_protected_tokens(

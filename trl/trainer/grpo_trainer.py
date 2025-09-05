@@ -786,11 +786,23 @@ class GRPOTrainer(Trainer):
         image_grid_thw=None,
         pixel_attention_mask=None,
         image_sizes=None,
+        images_per_sample=None,
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
+
+        # Precompute cumulative image counts / feature counts for Qwen-style inputs
+        if image_grid_thw is not None and pixel_values is not None:
+            # images_per_sample: shape [num_sequences], tells us how many rows in image_grid_thw belong to each sequence
+            if images_per_sample is None:
+                raise ValueError("images_per_sample is required when using image_grid_thw  pixel_values.")
+            img_counts = images_per_sample.detach().cpu().to(torch.long)
+            img_cumsum = torch.nn.functional.pad(img_counts, (1, 0)).cumsum(0)  # [num_seq1]
+            thw_prod = image_grid_thw.prod(-1)  # [total_images]
+            feat_cumsum = torch.nn.functional.pad(thw_prod, (1, 0)).cumsum(0)  # [total_images1]
+
         for start in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
@@ -799,16 +811,37 @@ class GRPOTrainer(Trainer):
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
 
             if image_grid_thw is not None and pixel_values is not None:
-                model_inputs["image_grid_thw"] = image_grid_thw[start : start + batch_size]
-                start_pixel_idx = image_grid_thw[:start].prod(-1).sum().item()
-                end_pixel_idx = image_grid_thw[: start + batch_size].prod(-1).sum().item()
+                # Map sequence-chunk [start:end) -> image-row-chunk [img_row_start:img_row_end)
+                end = min(start + batch_size, input_ids.size(0))
+                img_row_start = img_cumsum[start].item()
+                img_row_end = img_cumsum[end].item()
+
+                image_grid_thw_batch = image_grid_thw[img_row_start:img_row_end]
+                model_inputs["image_grid_thw"] = image_grid_thw_batch
+
+                start_pixel_idx = feat_cumsum[img_row_start].item()
+                end_pixel_idx = feat_cumsum[img_row_end].item()
+                pixel_values_batch = pixel_values[start_pixel_idx:end_pixel_idx]
+                model_inputs["pixel_values"] = pixel_values_batch
+
+                # If you pass these for Qwen, they are per-image → slice by image rows too
+                if pixel_attention_mask is not None:
+                    model_inputs["pixel_attention_mask"] = pixel_attention_mask[img_row_start:img_row_end]
+                if image_sizes is not None:
+                    model_inputs["image_sizes"] = image_sizes[img_row_start:img_row_end]
+
                 model_inputs["pixel_values"] = pixel_values[start_pixel_idx:end_pixel_idx]
+
             elif pixel_values is not None:
                 model_inputs["pixel_values"] = pixel_values[start : start + batch_size]
-            if pixel_attention_mask is not None:
-                model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
-            if image_sizes is not None:
-                model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
+            
+            # not qwen... TBD if works....
+            if not (image_grid_thw is not None and pixel_values is not None):
+                if pixel_attention_mask is not None:
+                    model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
+
+                if image_sizes is not None:
+                    model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
 
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
@@ -1082,6 +1115,17 @@ class GRPOTrainer(Trainer):
 
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
+        # --- DEBUG: check dataset vs template placeholders ---
+        if self.accelerator.is_main_process:
+            want = [len(x or []) for x in images]  # dataset-side images per sample
+            placeholders = [
+                prompts_text[i].count(self.image_token) if self.image_token else 0
+                for i in range(len(prompts_text))
+            ]
+            print("[GRPO DEBUG] images/dataset (head):", want[:8])
+            print("[GRPO DEBUG] placeholders in text (head):", placeholders[:8])
+        # ------------------------------------------------------
+
         prompt_inputs = self.processing_class(
             text=prompts_text,
             return_tensors="pt",
@@ -1090,6 +1134,29 @@ class GRPOTrainer(Trainer):
             add_special_tokens=False,
             **kwargs,
         )
+
+        # <<< START: ADD DEBUG PRINTS HERE >>>
+        print("\n--- [DEBUG] Step 1: Initial Tokenization ---")
+        if self.accelerator.is_main_process:
+            print(f"Batch size (number of prompts): {len(prompts_text)}")
+            print(f"prompt_inputs['input_ids'].shape: {prompt_inputs['input_ids'].shape}")
+            if 'pixel_values' in prompt_inputs:
+                print(f"prompt_inputs['pixel_values'].shape: {prompt_inputs['pixel_values'].shape}")
+                print(f"prompt_inputs['image_grid_thw'].shape: {prompt_inputs['image_grid_thw'].shape}")
+                
+                # Count the number of image tokens
+                image_token_count = (prompt_inputs['input_ids'] == self.image_token_id).sum().item()
+                print(f"Number of image tokens found: {image_token_count}")
+                
+                # The number of features should match the number of tokens
+                # For Qwen, this is sum of prod of image_grid_thw
+                expected_features = prompt_inputs['image_grid_thw'].prod(-1).sum().item()
+                print(f"Expected image features based on image_grid_thw: {expected_features}")
+            else:
+                print("No pixel_values found in initial prompt_inputs.")
+        print("--- [DEBUG] End of Step 1 ---\n")
+        # <<< END: ADD DEBUG PRINTS HERE >>>
+
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
@@ -1377,6 +1444,7 @@ class GRPOTrainer(Trainer):
                     image_grid_thw=prompt_inputs.get("image_grid_thw"),
                     pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                     image_sizes=prompt_inputs.get("image_sizes"),
+                    images_per_sample=prompt_inputs.get("images_per_sample"),
                 )
             else:
                 old_per_token_logps = None
@@ -1401,6 +1469,7 @@ class GRPOTrainer(Trainer):
                         image_grid_thw=prompt_inputs.get("image_grid_thw"),
                         pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                         image_sizes=prompt_inputs.get("image_sizes"),
+                        images_per_sample=prompt_inputs.get("images_per_sample"),
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
@@ -1414,12 +1483,19 @@ class GRPOTrainer(Trainer):
                             image_grid_thw=prompt_inputs.get("image_grid_thw"),
                             pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                             image_sizes=prompt_inputs.get("image_sizes"),
+                            images_per_sample=prompt_inputs.get("images_per_sample"),
                         )
             else:
                 ref_per_token_logps = None
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+        # Record per-sample image counts so we can slice per-image tensors correctly later
+        images_per_sample = None
+        if has_images:
+            images_per_sample = torch.tensor([len(imgs or []) for imgs in images], device=self.accelerator.device)
+
         if is_conversational(inputs[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
@@ -1562,6 +1638,10 @@ class GRPOTrainer(Trainer):
             output["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"]
         if "image_sizes" in prompt_inputs:
             output["image_sizes"] = prompt_inputs["image_sizes"]
+
+        if images_per_sample is not None:
+            output["images_per_sample"] = images_per_sample
+
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -1636,6 +1716,7 @@ class GRPOTrainer(Trainer):
             image_grid_thw=inputs.get("image_grid_thw"),
             pixel_attention_mask=inputs.get("pixel_attention_mask"),
             image_sizes=inputs.get("image_sizes"),
+            images_per_sample=inputs.get("images_per_sample"),
         )
 
         if self.top_entropy_quantile < 1.0:
