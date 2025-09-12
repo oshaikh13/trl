@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pdb
+
 import copy
 import inspect
 import os
@@ -1115,16 +1117,6 @@ class GRPOTrainer(Trainer):
 
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
 
-        # --- DEBUG: check dataset vs template placeholders ---
-        if self.accelerator.is_main_process:
-            want = [len(x or []) for x in images]  # dataset-side images per sample
-            placeholders = [
-                prompts_text[i].count(self.image_token) if self.image_token else 0
-                for i in range(len(prompts_text))
-            ]
-            print("[GRPO DEBUG] images/dataset (head):", want[:8])
-            print("[GRPO DEBUG] placeholders in text (head):", placeholders[:8])
-        # ------------------------------------------------------
 
         prompt_inputs = self.processing_class(
             text=prompts_text,
