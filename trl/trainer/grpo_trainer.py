@@ -1496,6 +1496,100 @@ class GRPOTrainer(Trainer):
         else:
             completions = completions_text
 
+
+        # --- GT likelihood stitching (no row skipping) --------------------------------
+        # stop_after = getattr(self.args, "stop_after_substring", None)
+        # gt_field   = getattr(self.args, "ground_truth_field", None)
+        # gt_reduce  = getattr(self.args, "gt_reduce", "sum")  # "sum" or "mean"
+
+        # hardcode for now
+        stop_after = "<action>"
+        gt_field = "solution"
+        gt_reduce = "mean"
+
+        if stop_after and gt_field:
+            def truncate_before_marker(s: str, marker: str):
+                idx = s.find(marker)
+                if idx == -1:
+                    return None  # no marker, so no GT stitching
+                return s[:idx]
+
+            # Prefixes & validity
+            prefixes = [truncate_before_marker(c, stop_after) for c in completions_text]
+            has_marker = [p is not None for p in prefixes]
+
+            # Normalize GTs and build stitched completions
+            gt_texts = [ex.get(gt_field, "") for ex in inputs]
+            stitched_texts = [
+                # Append GT only if marker exists-
+                (prefixes[i] + gt_texts[i]) if prefixes[i] is not None else completions_text[i]
+                for i in range(len(completions_text))
+            ]
+
+            # Tokenize stitched completions & GT-only (batch-wide)
+            stitched_tok = self.processing_class(
+                text=stitched_texts,
+                return_tensors="pt",
+                padding=True,
+                padding_side="right",
+                add_special_tokens=False,
+            )
+            stitched_tok = super()._prepare_inputs(stitched_tok)
+
+            gt_only_tok = self.processing_class(
+                text=gt_texts,
+                return_tensors="pt",
+                padding=True,
+                padding_side="right",
+                add_special_tokens=False,
+            )
+            gt_only_tok = super()._prepare_inputs(gt_only_tok)
+
+            # Build conditioning and score per-token logps for stitched completion
+            stitched_ids  = stitched_tok["input_ids"]
+            stitched_mask = stitched_tok["attention_mask"]
+            full_ids  = torch.cat([prompt_ids,  stitched_ids],  dim=1)
+            full_mask = torch.cat([prompt_mask, stitched_mask], dim=1)
+
+            logits_to_keep = stitched_ids.size(1)
+            batch_size = self.args.per_device_train_batch_size if self.model.training else self.args.per_device_eval_batch_size
+
+            per_token_logps_stitched, _ = self._get_per_token_logps_and_entropies(
+                self.model,
+                full_ids,
+                full_mask,
+                logits_to_keep,
+                batch_size=batch_size,
+                pixel_values=prompt_inputs.get("pixel_values"),
+                image_grid_thw=prompt_inputs.get("image_grid_thw"),
+                pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+                image_sizes=prompt_inputs.get("image_sizes"),
+                images_per_sample=prompt_inputs.get("images_per_sample"),
+            )
+
+            gt_lens = gt_only_tok["attention_mask"].sum(dim=1)  # (B,)
+            has_marker_tensor = torch.tensor(has_marker, device=gt_lens.device, dtype=gt_lens.dtype)
+            gt_lens = gt_lens * has_marker_tensor  # zero-out when marker absent
+
+            T = stitched_ids.size(1)
+            arange = torch.arange(T, device=gt_lens.device).unsqueeze(0).expand(gt_lens.size(0), T)
+            gt_mask = (arange >= (T - gt_lens.unsqueeze(1))).int()  # (B, T); rows w/o marker become all zeros
+
+            denom = gt_lens.clamp(min=1).float()
+            if gt_reduce == "mean":
+                gt_ll = (per_token_logps_stitched * gt_mask).sum(dim=1) / denom
+            else:  # "sum"
+                gt_ll = (per_token_logps_stitched * gt_mask).sum(dim=1)
+
+            #
+            for i, ex in enumerate(inputs):
+                ex["prefix_before_marker"] = prefixes[i]
+                ex["gt_len"]               = int(gt_lens[i].item())
+                ex["stitched_completion"]  = stitched_texts[i]
+
+                ex["gt_loglik"] = float(gt_ll[i].item()) if ex["gt_len"] > 0 else None
+        # --- end GT stitching ----------------------------------------------------------
+
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.

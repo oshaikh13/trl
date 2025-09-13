@@ -636,6 +636,29 @@ class GRPOConfig(TrainingArguments):
         },
     )
 
+    stop_after_substring: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Substring marker inside a rollout where we truncate before scoring GT. "
+                    "If not found in a rollout, gt_loglik will be None for that sample."
+        },
+    )
+
+    ground_truth_field: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Name of the field in each training example dict that holds the ground truth text."
+        },
+    )
+
+    gt_reduce: str = field(
+        default="sum",
+        metadata={
+            "help": "How to aggregate per-token logprobs over the GT region. "
+                    "'sum' gives total log-likelihood, 'mean' gives average logprob per token."
+        },
+    )
+
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
