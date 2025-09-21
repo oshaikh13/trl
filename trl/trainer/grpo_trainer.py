@@ -789,6 +789,7 @@ class GRPOTrainer(Trainer):
         pixel_attention_mask=None,
         image_sizes=None,
         images_per_sample=None,
+        apply_temperature=True,
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
@@ -859,7 +860,9 @@ class GRPOTrainer(Trainer):
             logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits = logits / self.temperature
+
+            if apply_temperature:
+                logits = logits / self.temperature
 
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
@@ -1554,18 +1557,20 @@ class GRPOTrainer(Trainer):
             logits_to_keep = stitched_ids.size(1)
             batch_size = self.args.per_device_train_batch_size if self.model.training else self.args.per_device_eval_batch_size
 
-            per_token_logps_stitched, _ = self._get_per_token_logps_and_entropies(
-                self.model,
-                full_ids,
-                full_mask,
-                logits_to_keep,
-                batch_size=batch_size,
-                pixel_values=prompt_inputs.get("pixel_values"),
-                image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                image_sizes=prompt_inputs.get("image_sizes"),
-                images_per_sample=prompt_inputs.get("images_per_sample"),
-            )
+            with torch.no_grad():
+                per_token_logps_stitched, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    full_ids,
+                    full_mask,
+                    logits_to_keep,
+                    batch_size=batch_size,
+                    pixel_values=prompt_inputs.get("pixel_values"),
+                    image_grid_thw=prompt_inputs.get("image_grid_thw"),
+                    pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+                    image_sizes=prompt_inputs.get("image_sizes"),
+                    images_per_sample=prompt_inputs.get("images_per_sample"),
+                    apply_temperature=False,
+                )
 
             gt_lens = gt_only_tok["attention_mask"].sum(dim=1)  # (B,)
             has_marker_tensor = torch.tensor(has_marker, device=gt_lens.device, dtype=gt_lens.dtype)
