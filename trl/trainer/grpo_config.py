@@ -659,6 +659,22 @@ class GRPOConfig(TrainingArguments):
         },
     )
 
+    # ----- Trace / Retrieval pipeline -----
+    enable_think_revise: bool = False
+    reinforce_on: str = "final"  # "final" | "revise" | "all"
+    span_weights: Optional[dict] = None  # e.g., {"think":0.3,"revise":0.7,"final":1.0}
+    retriever_top_k: int = 5
+    memory_top_m: int = 3
+    mmr_alpha: float = 0.7
+    dedup_jaccard: float = 0.8
+    memory_namespace: str = "train"
+    time_decay_lambda: Optional[float] = None
+    retrieval_shaping_coef: float = 0.0
+
+    # ----- vLLM guided stops (optional) -----
+    think_block_regex: Optional[str] = None    # if None, we stop at </think>
+    revise_block_regex: Optional[str] = None   # if None, we stop at </revise>
+
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
@@ -712,3 +728,4 @@ class GRPOConfig(TrainingArguments):
 
         if self.delta is not None and self.use_liger_loss:
             raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
+
