@@ -660,7 +660,7 @@ class GRPOConfig(TrainingArguments):
     )
 
     # ----- Trace / Retrieval pipeline -----
-    enable_think_revise: bool = False
+    enable_think_revise: bool = True
     reinforce_on: str = "final"  # "final" | "revise" | "all"
     span_weights: Optional[dict] = None  # e.g., {"think":0.3,"revise":0.7,"final":1.0}
     retriever_top_k: int = 5

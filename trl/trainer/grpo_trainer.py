@@ -688,36 +688,29 @@ class GRPOTrainer(Trainer):
         return ids_l, lps_l, texts
 
     def _p_think(self, base_ctx: str, n_claims: int) -> str:
-        return f"""Analyze the user’s likely next steps. First, generate exactly {n_claims} claim about the user.
-Output them ONLY as <claim>...</claim> tags inside the <think> block.
+        head, sep, tail = base_ctx.rpartition("<|im_end|>")
+        base_ctx = (head + tail).strip()  # if not found, base_ctx stays the same
 
-<think>"""
+        return f"""{base_ctx}\nAnalyze the user’s likely next steps. First, generate exactly {n_claims} claim about the user.
+Output them ONLY as <claim>...</claim> tags inside the <think> block.<|im_end|>
+<|im_start|>assistant\n<think>\n"""
 
-    def _p_revise(self, base_ctx: str, think_block: str, retrieved_txt: str, n_claims: int) -> str:
-        return f"""{base_ctx}
-
-{think_block}
-
+    def _p_revise(self, think_block: str, retrieved_txt: str, n_claims: int) -> str:
+        return f"""{think_block}<|im_end|>
+<|im_start|>user\n
 Here are retrieved claims and context (time-aware):
 {retrieved_txt or "- (none)"}
 
-Using your claims and the retrieved context, generate exactly {n_claims} revised claims.
-Output them ONLY as <claim>...</claim> tags inside a <revise> block.
+Using your claims and the retrieved context, generate a final set of {n_claims} revised claims.
+Output them ONLY as <claim>...</claim> tags inside a <revise> block.<|im_end|>
+<|im_start|>assistant\n<revise>\n"""
 
-<revise>"""
-
-    def _p_actions(self, base_ctx: str, think_block: str, revise_block: str, future_len: int) -> str:
-        return f"""{base_ctx}
-
-{think_block}
-
-{revise_block}
-
-Then, using your claims, generate exactly {future_len} next actions the user will take.
-Output them ONLY as <action>...</action> tags inside <actions> block, with each action wrapped in its own <action> tag.
-
-<actions>"""
-
+    def _p_actions(self, revise_block: str, future_len: int) -> str:
+        return f"""{revise_block}<|im_end|>
+<|im_start|>user\n
+Now, using your claims, generate exactly {future_len} next actions the user will take.
+Output them ONLY as <action>...</action> tags inside <actions> block, with each action wrapped in its own <action> tag.<|im_end|>
+<|im_start|>assistant\n<actions>\n"""
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1333,6 +1326,11 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
                 think_prompts, stop=["</think>"], max_tokens=1024, images_list=images_list
             )
 
+            # ---- DEBUG PRINT THINK TEXT ----
+            if self.accelerator.is_main_process:
+                print(f"Think Text: {think_texts[0]}")
+            # ---- END DEBUG PRINT THINK TEXT ----
+
             # ---- RETRIEVE (time-aware BM25 over the whole think block) ----
             queries = think_texts
             hits_lists = self._dist_retr.query_batch(
@@ -1345,40 +1343,60 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
             )
             retrieved_txts = ["\n".join(f"- {h['text']}" for h in hits) for hits in hits_lists]
 
+            
+            # ---- DEBUG PRINT RETRIEVED TEXT ----
+            if self.accelerator.is_main_process:
+                print(f"Retrieved Text: {retrieved_txts[0]}")
+            # ---- END DEBUG PRINT RETRIEVED TEXT ----
+            
+
             # ---- REVISE (stop at </revise>) ----
+
+            joint_revise = [think_prompts[i] + think_texts[i] for i in range(B)]
             revise_prompts = [
-                self._p_revise(base_ctxs[i], think_texts[i], retrieved_txts[i], n_claimses[i]) for i in range(B)
+                self._p_revise(joint_revise[i], retrieved_txts[i], n_claimses[i]) for i in range(B)
             ]
             revise_ids, revise_lps, revise_texts = self._vllm_gen_batch(
                 revise_prompts, stop=["</revise>"], max_tokens=1024, images_list=images_list
             )
 
+            # ---- DEBUG PRINT REVISE TEXT ----
+            if self.accelerator.is_main_process:
+                print(f"Revise Text: {revise_texts[0]}")
+            # ---- END DEBUG PRINT REVISE TEXT ----
+
             # ---- ACTIONS (stop at </actions>) ----
             actions_prompts = [
-                self._p_actions(base_ctxs[i], think_texts[i], revise_texts[i], future_lens[i]) for i in range(B)
+                self._p_actions(revise_prompts[i] + revise_texts[i], future_lens[i]) for i in range(B)
             ]
             actions_ids, actions_lps, actions_texts = self._vllm_gen_batch(
                 actions_prompts, stop=["</actions>"], max_tokens=1024, images_list=images_list
             )
 
-            gen_ids = [
-                torch.tensor(think_ids[i] + revise_ids[i] + actions_ids[i], device=device) for i in range(B)
-            ]
-            gen_lps = [
-                torch.tensor(think_lps[i] + revise_lps[i] + actions_lps[i], device=device, dtype=torch.float32)
-                for i in range(B)
-            ]
+            # Use only the final stage for training to keep prefixes aligned.
+            actions_prompt_inputs = self.processing_class(
+                text=actions_prompts,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                add_special_tokens=False,
+            )
+            actions_prompt_inputs = super()._prepare_inputs(actions_prompt_inputs)
 
-            # Pad once to tensors [B, T]
-            completion_ids  = pad(gen_ids, padding_value=self.pad_token_id)
-            completion_mask = pad([torch.ones_like(x, dtype=torch.int) for x in gen_ids], padding_value=0)
-            sampling_per_token_logps = pad(gen_lps, padding_value=0.0)
+            prompt_ids  = actions_prompt_inputs["input_ids"]
+            prompt_mask = actions_prompt_inputs["attention_mask"]
+
+            completion_ids = pad([torch.tensor(x, device=device) for x in actions_ids],
+                                padding_value=self.pad_token_id)
+
+            sampling_per_token_logps = pad([torch.tensor(x, device=device, dtype=torch.float32)
+                                        for x in actions_lps], padding_value=0.0)
 
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-            
+
+            pdb.set_trace()
             # log decoded text if you like; the method will re-decode later too.
             # completions_text = [self.processing_class.decode(x.tolist(), skip_special_tokens=True) for x in gen_ids]
-
 
         else:
             # Generate completions using either vLLM or regular generation
@@ -1690,7 +1708,7 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
         # gt_reduce  = getattr(self.args, "gt_reduce", "sum")  # "sum" or "mean"
 
         # hardcode for now
-        stop_after = "<action>"
+        stop_after = "<actions>"
         gt_field = "solution"
         gt_reduce = "mean"
 
