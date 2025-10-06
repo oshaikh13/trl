@@ -697,7 +697,7 @@ Output them ONLY as <claim>...</claim> tags inside the <think> block.<|im_end|>
 
     def _p_revise(self, think_block: str, retrieved_txt: str, n_claims: int) -> str:
         return f"""{think_block}<|im_end|>
-<|im_start|>user\n
+<|im_start|>user
 Here are retrieved claims and context (time-aware):
 {retrieved_txt or "- (none)"}
 
@@ -707,7 +707,7 @@ Output them ONLY as <claim>...</claim> tags inside a <revise> block.<|im_end|>
 
     def _p_actions(self, revise_block: str, future_len: int) -> str:
         return f"""{revise_block}<|im_end|>
-<|im_start|>user\n
+<|im_start|>user
 Now, using your claims, generate exactly {future_len} next actions the user will take.
 Output them ONLY as <action>...</action> tags inside <actions> block, with each action wrapped in its own <action> tag.<|im_end|>
 <|im_start|>assistant\n<actions>\n"""
@@ -1373,30 +1373,84 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
                 actions_prompts, stop=["</actions>"], max_tokens=1024, images_list=images_list
             )
 
-            # Use only the final stage for training to keep prefixes aligned.
-            actions_prompt_inputs = self.processing_class(
-                text=actions_prompts,
+            # stitch the right trajectories-
+            # 1) Compute interstitial plaintexts (suffixes the model saw between stages)
+            # joint_revise[i] = think_prompts[i] + think_texts[i]  # from your code
+            revise_interstitial = [
+                revise_prompts[i][len(joint_revise[i]):]  # text between </think> output and <revise> start
+                for i in range(B)
+            ]
+            actions_interstitial = [
+                actions_prompts[i][len(revise_prompts[i] + revise_texts[i]):]  # text between </revise> output and <actions> start
+                for i in range(B)
+            ]
+
+            # 2) Use the exact THINK prompt as the replay prompt (keeps conditioning identical)
+            think_prompt_inputs = self.processing_class(
+                text=think_prompts,
                 return_tensors="pt",
                 padding=True,
                 padding_side="left",
                 add_special_tokens=False,
+                **({"images": images_list} if has_images else {}),
             )
-            actions_prompt_inputs = super()._prepare_inputs(actions_prompt_inputs)
+            think_prompt_inputs = super()._prepare_inputs(think_prompt_inputs)
+            prompt_ids  = think_prompt_inputs["input_ids"].to(device)
+            prompt_mask = think_prompt_inputs["attention_mask"].to(device)
 
-            prompt_ids  = actions_prompt_inputs["input_ids"]
-            prompt_mask = actions_prompt_inputs["attention_mask"]
+            # 3) Build stitched completion per sample: [THINK] + (rev suffix) + [REVISE] + (act suffix) + [ACTIONS]
+            stitched_completion_ids = []
+            stitched_completion_mask = []   # 1 on generated tokens, 0 on interstitials
+            stitched_sampling_lps = []
 
-            completion_ids = pad([torch.tensor(x, device=device) for x in actions_ids],
-                                padding_value=self.pad_token_id)
+            for i in range(B):
+                # Tokenize the interstitial suffixes as plain text
+                rev_suf_ids = self.processing_class(
+                    text=[revise_interstitial[i]], return_tensors="pt", add_special_tokens=False, padding=False
+                )["input_ids"][0].to(device)
 
-            sampling_per_token_logps = pad([torch.tensor(x, device=device, dtype=torch.float32)
-                                        for x in actions_lps], padding_value=0.0)
+                act_suf_ids = self.processing_class(
+                    text=[actions_interstitial[i]], return_tensors="pt", add_special_tokens=False, padding=False
+                )["input_ids"][0].to(device)
 
-            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+                # Generated token ids/logprobs from vLLM
+                t_ids = torch.tensor(think_ids[i],  device=device, dtype=torch.long)
+                r_ids = torch.tensor(revise_ids[i], device=device, dtype=torch.long)
+                a_ids = torch.tensor(actions_ids[i], device=device, dtype=torch.long)
 
+                t_lps = torch.tensor(think_lps[i],  device=device, dtype=torch.float32)
+                r_lps = torch.tensor(revise_lps[i], device=device, dtype=torch.float32)
+                a_lps = torch.tensor(actions_lps[i], device=device, dtype=torch.float32)
+
+                ids_i = torch.cat([t_ids, rev_suf_ids, r_ids, act_suf_ids, a_ids], dim=0)
+                mask_i = torch.cat([
+                    torch.ones_like(t_ids,      dtype=torch.int),
+                    torch.zeros_like(rev_suf_ids, dtype=torch.int),
+                    torch.ones_like(r_ids,      dtype=torch.int),
+                    torch.zeros_like(act_suf_ids, dtype=torch.int),
+                    torch.ones_like(a_ids,      dtype=torch.int),
+                ], dim=0)
+                lps_i = torch.cat([
+                    t_lps,
+                    torch.zeros(rev_suf_ids.size(0), device=device),
+                    r_lps,
+                    torch.zeros(act_suf_ids.size(0), device=device),
+                    a_lps,
+                ], dim=0)
+
+                stitched_completion_ids.append(ids_i)
+                stitched_completion_mask.append(mask_i)
+                stitched_sampling_lps.append(lps_i)
+
+            # 4) Pad across batch and assemble inputs
+            completion_ids           = pad(stitched_completion_ids,  padding_value=self.pad_token_id)
+            completion_mask          = pad(stitched_completion_mask, padding_value=0)
+            sampling_per_token_logps = pad(stitched_sampling_lps,    padding_value=0.0)
+
+            prompt_completion_ids = torch.cat([prompt_ids,  completion_ids],  dim=1)
+            attention_mask        = torch.cat([prompt_mask, completion_mask], dim=1)
+            
             pdb.set_trace()
-            # log decoded text if you like; the method will re-decode later too.
-            # completions_text = [self.processing_class.decode(x.tolist(), skip_special_tokens=True) for x in gen_ids]
 
         else:
             # Generate completions using either vLLM or regular generation
