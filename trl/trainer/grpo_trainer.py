@@ -1450,8 +1450,6 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
             prompt_completion_ids = torch.cat([prompt_ids,  completion_ids],  dim=1)
             attention_mask        = torch.cat([prompt_mask, completion_mask], dim=1)
             
-            pdb.set_trace()
-
         else:
             # Generate completions using either vLLM or regular generation
             if self.use_vllm:
