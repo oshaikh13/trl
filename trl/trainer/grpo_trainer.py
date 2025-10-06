@@ -50,6 +50,7 @@ from transformers import (
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_flash_attn_2_available, is_peft_available, is_rich_available
+from transformers import TrainerCallback
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template, prepare_multimodal_messages
 from ..extras.profiling import profiling_context, profiling_decorator
@@ -103,6 +104,16 @@ logger = logging.get_logger(__name__)
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+class ResetRetrieverCallback(TrainerCallback):
+    def __init__(self, dist_retriever):
+        self.dist_retriever = dist_retriever
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        # wipe memory at the start of each epoch
+        if self.dist_retriever is not None:
+            self.dist_retriever.reset()
+        return control
 
 
 class GRPOTrainer(Trainer):
@@ -406,6 +417,9 @@ class GRPOTrainer(Trainer):
         # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
         # This acts as a flag to indicate that the warning has already been issued.
         model.warnings_issued["estimate_tokens"] = True
+
+        if self._dist_retr is not None:
+            callbacks = callbacks + [ResetRetrieverCallback(self._dist_retr)]
 
         super().__init__(
             model=model,
@@ -1341,7 +1355,7 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
                 time_decay_lambda=self.args.time_decay_lambda,
                 namespaces=[self.memory_namespace],
             )
-            retrieved_txts = ["\n".join(f"- {h['text']}" for h in hits) for hits in hits_lists]
+            retrieved_txts = ["\n".join(f"{h['text']}" for h in hits) for hits in hits_lists]
 
             
             # ---- DEBUG PRINT RETRIEVED TEXT ----
@@ -1890,18 +1904,38 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
 
         # time to SAVE!
 
+        # helper: pull out individual <claim>...</claim> chunks
+        def _extract_claims(txt: str) -> list[str]:
+            claims = re.findall(r"<claim>(.*?)</claim>", txt, flags=re.S | re.I)
+            # clean up whitespace
+            return ["<claim>" + c.strip() + "</claim>" for c in claims if c.strip()]
+
         if self.enable_think_revise and self._dist_retr is not None:
             local_rows = []
             for i in range(B):
-                local_rows.append({
-                    "text": revise_texts[i],              # raw free-form revision
-                    "utility": float(advantages[i].item()),
-                    "now_ts": now_tss[i],
-                    "bucket_key": (now_tss[i], hash(base_ctxs[i])),
-                })
+                # split the revise text into individual claims
+                claims_i = _extract_claims(revise_texts[i])
+
+                # fallback: if model failed to tag claims, store the whole revise block
+                if not claims_i:
+                    claims_i = [revise_texts[i].strip()]
+
+                # simple utility allocation: split the sequence advantage across claims
+                # (you could also keep the full advantage per claim if you prefer)
+                util_per = float(advantages[i].item()) / max(1, len(claims_i))
+
+                for claim in claims_i:
+                    local_rows.append({
+                        "text": claim,
+                        "utility": util_per,
+                        "now_ts": now_tss[i],
+                        # bucket on content so duplicates collapse naturally across steps
+                        "bucket_key": (now_tss[i], hash(claim.lower())),
+                    })
+
             self._dist_retr.add_candidates_parsimonious(
                 local_rows,
-                dedup_sim_fn=lambda a,b: jaccard_ngrams(a,b,n=3),
+                dedup_sim_fn=lambda a, b: jaccard_ngrams(a, b, n=3),
                 mmr_select_fn=lambda items, sim_fn, top_m, alpha: mmr_select(items, sim_fn, top_m, alpha),
                 top_m=self.memory_top_m,
                 alpha=self.mmr_alpha,

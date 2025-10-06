@@ -40,6 +40,12 @@ class DistributedRetriever:
     def query_single(self, query, cutoff_ts, top_k, time_decay_lambda=None, namespaces=None):
         return self.query_batch([query], [cutoff_ts], top_k, time_decay_lambda, namespaces)[0]
 
+    def reset(self):
+        if self.acc.is_main_process:
+            if hasattr(self.retriever, "reset"):
+                self.retriever.reset()
+        self.acc.wait_for_everyone()
+
     def add_candidates_parsimonious(self, local_rows, *, dedup_sim_fn, mmr_select_fn, top_m, alpha, visible_delay=1):
         acc = self.acc
         all_rows = gather_object(local_rows)

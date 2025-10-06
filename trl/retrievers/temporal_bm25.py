@@ -10,6 +10,12 @@ class InMemoryBM25Temporal:
 
     def _toks(self, s): return [t.lower() for t in self._tok.findall(s)]
 
+    def reset(self):
+        self.docs = []
+        self.df = Counter()
+        self.N = 0
+        self.avgdl = 0.0
+
     def add(self, text: str, *, event_ts: int, visible_after_ts: Optional[int] = None,
             namespace: str = "train", metadata: Optional[dict] = None):
         if visible_after_ts is None: visible_after_ts = event_ts
