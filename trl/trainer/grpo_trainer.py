@@ -418,9 +418,6 @@ class GRPOTrainer(Trainer):
         # This acts as a flag to indicate that the warning has already been issued.
         model.warnings_issued["estimate_tokens"] = True
 
-        if self._dist_retr is not None:
-            callbacks = callbacks + [ResetRetrieverCallback(self._dist_retr)]
-
         super().__init__(
             model=model,
             args=args,
@@ -633,9 +630,12 @@ class GRPOTrainer(Trainer):
             self.mmr_alpha = args.mmr_alpha
             self.dedup_jacc = args.dedup_jaccard
             self.memory_namespace = args.memory_namespace
+            self.add_callback(ResetRetrieverCallback(self._dist_retr))
         else:
             self.retriever = None
             self._dist_retr = None
+
+
 
     def _vllm_gen_batch(self, prompts, stop=None, max_tokens=None, images_list=None):
         """
