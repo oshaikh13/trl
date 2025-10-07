@@ -665,7 +665,7 @@ class GRPOTrainer(Trainer):
             top_k=-1 if self.top_k is None else self.top_k,
             min_p=0.0 if self.min_p is None else self.min_p,
             max_tokens=max_tokens or self.max_completion_length,
-            logprobs=1,             # IMPORTANT: needed for IS correction
+            logprobs=0,             # IMPORTANT: needed for IS correction
             stop=stop,              # e.g. ["</think>"], ["</revise>"], ["</actions>"]
         )
 
@@ -712,7 +712,7 @@ Output them ONLY as <claim>...</claim> tags inside the <think> block.<|im_end|>
     def _p_revise(self, think_block: str, retrieved_txt: str, n_claims: int) -> str:
         return f"""{think_block}<|im_end|>
 <|im_start|>user
-Here are retrieved claims and context (time-aware):
+Here are retrieved claims and context (time-aware):\n
 {retrieved_txt or "- (none)"}
 
 Using your claims and the retrieved context, generate a final set of {n_claims} revised claims.
@@ -1658,31 +1658,48 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
                 prompt_ids = prompt_completion_ids[:, :prompt_length]
                 completion_ids = prompt_completion_ids[:, prompt_length:]
 
-        # Mask everything after the first EOS token
-        is_eos = completion_ids == self.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
-        # to re-tokenize completions if the reward is computed from tokens.
+        # --- build completion mask ---
+        if self.enable_think_revise:
+            # We already constructed `completion_mask` when stitching:
+            #   generated tokens = 1
+            #   interstitial suffix tokens = 0
+            # Drop padding, but otherwise trust the stitched mask as source of truth.
+            nonpad = (completion_ids != self.pad_token_id).int()
+            completion_mask = completion_mask * nonpad  # <-- preserve your generated-vs-interstitial intent
+            used_eos_mask = False
+            # (Optional) In stitched mode, skip truncation masking entirely. Your vLLM stops on </think>, </revise>, </actions>.
+            # If you later want truncation handling, use vLLM's finish_reason to detect max_tokens hits instead of EOS.
+            # if self.mask_truncated_completions:
+            #     pass  # no-op in stitched mode
+
+        else:
+            used_eos_mask = True
+            # Original EOS path for non-multiturn runs
+            is_eos = completion_ids == self.eos_token_id
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+            completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+            # Drop PADs here too, so padding never leaks into loss/metrics
+            completion_mask = completion_mask * (completion_ids != self.pad_token_id).int()
+
+            if self.mask_truncated_completions:
+                truncated_completions = ~is_eos.any(dim=1)
+                completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
+
+        # Build list for reward funcs + downstream accounting using the final mask
         completion_ids_list = [row[mask_row].tolist() for row, mask_row in zip(completion_ids, completion_mask.bool())]
 
-        # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
+        # Completion lengths and batch normalizer
         completion_lengths = completion_mask.sum(1)
         agg_completion_lengths = self.accelerator.gather(completion_lengths)
-        num_items_in_batch = agg_completion_lengths.sum()  # this is required for the DAPO loss
+        num_items_in_batch = agg_completion_lengths.sum()
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
-        if self.mask_truncated_completions:
-            truncated_completions = ~is_eos.any(dim=1)
-            completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        # Final attention mask
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         with torch.no_grad():
@@ -1954,15 +1971,18 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
         # Identify sequences that terminated with EOS and log their lengths
-        agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
-        term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
-        clipped_completions_ratio = 1 - len(term_completion_lengths) / len(agg_completion_lengths)
-        self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
-        if len(term_completion_lengths) == 0:  # edge case where no terminated sequences are found
-            term_completion_lengths = torch.zeros(1, device=device)
-        self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
-        self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
-        self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+        if used_eos_mask:
+            agg_terminated_with_eos = self.accelerator.gather(is_eos.any(dim=1))
+            term_completion_lengths = agg_completion_lengths[agg_terminated_with_eos]
+            clipped_completions_ratio = 1 - len(term_completion_lengths) / max(1, len(agg_completion_lengths))
+            self._metrics[mode]["completions/clipped_ratio"].append(clipped_completions_ratio)
+
+            if len(term_completion_lengths) == 0:
+                term_completion_lengths = torch.zeros(1, device=device)
+
+            self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
+            self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
+            self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
