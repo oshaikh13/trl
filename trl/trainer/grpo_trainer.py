@@ -1637,6 +1637,8 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
                 prompt_ids = [torch.tensor(ids, device=device) for ids in paged_prompt_inputs.input_ids]
                 prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
                 prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
+
                 # Restore the original attention implementation, training mode
                 self.model_wrapped.config._attn_implementation = previous_attn
             else:
@@ -1698,7 +1700,9 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
         num_items_in_batch = agg_completion_lengths.sum()
 
         # Final attention mask
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        completion_attn_mask = (completion_ids != self.pad_token_id).int()
+        attention_mask       = torch.cat([prompt_mask, completion_attn_mask], dim=1)
+
         logits_to_keep = completion_ids.size(1)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
@@ -2069,7 +2073,11 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        # attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        # OLD: attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        completion_attn_mask = (completion_ids != self.pad_token_id).int()
+        attention_mask       = torch.cat([prompt_mask, completion_attn_mask], dim=1)
+
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Get the last hidden state of the model
@@ -2122,7 +2130,10 @@ Output them ONLY as <action>...</action> tags inside <actions> block, with each 
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        # OLD: attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        completion_attn_mask = (completion_ids != self.pad_token_id).int()
+        attention_mask       = torch.cat([prompt_mask, completion_attn_mask], dim=1)
+
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Compute the per_token_logps and the entropy at each position in the completion
