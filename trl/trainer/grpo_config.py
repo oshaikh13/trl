@@ -663,10 +663,10 @@ class GRPOConfig(TrainingArguments):
     enable_think_revise: bool = True
     reinforce_on: str = "final"  # "final" | "revise" | "all"
     span_weights: Optional[dict] = None  # e.g., {"think":0.3,"revise":0.7,"final":1.0}
-    retriever_top_k: int = 5
-    memory_top_m: int = 3
-    mmr_alpha: float = 0.7
-    dedup_jaccard: float = 0.8
+    retriever_top_k: int = 10  # Oversample from BM25 (should be 2-3x memory_top_m for MMR diversity)
+    memory_top_m: int = 3  # Final number of diverse results after MMR selection
+    mmr_alpha: float = 0.7  # MMR balance: relevance (alpha) vs diversity (1-alpha)
+    dedup_jaccard: float = 0.8  # Similarity threshold for database-level deduplication
     memory_namespace: str = "train"
     time_decay_lambda: Optional[float] = None
     retrieval_shaping_coef: float = 0.0
@@ -728,4 +728,6 @@ class GRPOConfig(TrainingArguments):
 
         if self.delta is not None and self.use_liger_loss:
             raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
+
+
 

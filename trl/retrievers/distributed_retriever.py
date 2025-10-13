@@ -46,23 +46,21 @@ class DistributedRetriever:
                 self.retriever.reset()
         self.acc.wait_for_everyone()
 
-    def add_candidates_parsimonious(self, local_rows, *, dedup_sim_fn, mmr_select_fn, top_m, alpha, visible_delay=1):
+    def add_candidates(self, local_rows, *, visible_delay=1):
+        """
+        Add candidates to the database. Deduplication happens at the database level
+        in the retriever.add() method.
+        """
         acc = self.acc
         all_rows = gather_object(local_rows)
         if acc.is_main_process:
-            from collections import defaultdict
-            buckets = defaultdict(list)
+            # Simply add all candidates - database will handle deduplication
             for r in all_rows:
-                buckets[r["bucket_key"]].append(r)
-            for _, rows in buckets.items():
-                items = [(r["text"], float(r["utility"]), r) for r in rows]
-                selected = mmr_select_fn(items, sim_fn=dedup_sim_fn, top_m=top_m, alpha=alpha)
-                for text, util, r in selected:
-                    self.retriever.add(
-                        text=text,
-                        event_ts=int(r["now_ts"]),
-                        visible_after_ts=int(r["now_ts"]) + visible_delay,
-                        namespace=self.namespace,
-                        metadata={"origin": "revise", "utility": util},
-                    )
+                self.retriever.add(
+                    text=r["text"],
+                    event_ts=int(r["now_ts"]),
+                    visible_after_ts=int(r["now_ts"]) + visible_delay,
+                    namespace=self.namespace,
+                    metadata={"origin": "revise", "utility": float(r["utility"])},
+                )
         acc.wait_for_everyone()
